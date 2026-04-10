@@ -1,3 +1,34 @@
+## 2026-04-10 (current)
+**Session type:** VS Code
+**ROI tag:** REVENUE
+**Tasks completed:**
+- Added invoice view tracking (Square has no native "viewed" API for SHARE_MANUALLY invoices)
+- New `InvoiceActivity` type on Parent: `{squareInvoiceId, publicUrl, amount, sentAt, viewedAt, viewCount, lastReminderAt}` keyed by month
+- New redirect route `src/app/r/[parentId]/[month]/route.ts` — logs `viewedAt` + `viewCount` to Firestore, then 302s to Square publicUrl
+- `sendTextToParent` now stamps `invoiceActivity[currentMonth]` and texts `${origin}/r/{parentId}/{month}` instead of raw Square URL. View count resets when invoiceId changes (cancelled+recreated).
+- Dashboard "Current Month — Invoice Status" panel above stats with 4 buckets: Paid / Viewed-Unpaid / Sent-Not-Viewed / Not-Sent. Click bucket → drilldown list with per-family Re-text + "Re-text all in bucket"
+- Action column shows "Viewed ✓ (Nx)" badge in yellow when invoice has been opened
+- `/api/square/sync` backfills `invoiceActivity` for unpaid invoices already in Square (so existing UNPAID invoices appear in buckets)
+- Build passes clean
+
+**Key decisions:**
+- Tracking via custom redirector (Square API doesn't expose view events). Acceptable trade-off: redirect adds one hop but gives full click telemetry.
+- Bucket "sentAt" only set when texted via dashboard. Backfilled invoices show as "Not Sent" until next text — intentional, since we genuinely don't know if a backfilled Square invoice was already delivered to the parent.
+- View tracking persists across invoice updates only when invoiceId is the same. Cancelling + recreating an invoice resets view count.
+
+**Current state:**
+- Feature implemented, build clean, NOT yet deployed to Netlify
+- Existing parents have no invoiceActivity until either (a) user clicks Text again, or (b) Sync Square is run
+
+**Open items:**
+- Deploy to Netlify (`npm run deploy` or `bash deploy.sh`)
+- User to run Sync Square so existing UNPAID invoices populate buckets
+- User to start texting via dashboard so view tracking begins flowing
+
+**To continue:** Deploy + Sync Square, then start texting families. The "Viewed · Unpaid" bucket is the highest-leverage reminder target.
+
+---
+
 ## 2026-03-09 17:30
 **Session type:** VS Code
 **Tasks completed:**
