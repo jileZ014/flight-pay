@@ -1,7 +1,22 @@
 ## 2026-04-10 (current)
 **Session type:** VS Code
-**ROI tag:** REVENUE
+**ROI tag:** REVENUE + INFRASTRUCTURE
 **Tasks completed:**
+
+**Data integrity audit + fixes (triggered by Lashay Espitia → Omar Rubalcaba mis-routed invoice)**
+- Built `/api/audit/sync` (full audit), `/api/audit/quick` (1.5s fast audit),
+  `/api/audit/fix`, `/api/audit/sync-phones-from-square`, `/api/audit/backfill`, `/api/audit/finalize`
+- Fixed 18 data issues in total:
+  - Lashay Espitia: phone 6234514092 (Omar's) → 6024591384, linked to Square PT1KHSRMRVKQ837DYH6M3K9G90
+  - Renamed Julianne Worthen → Julianne Levich (same person, name change)
+  - Swapped firstName/lastName on 4 records imported "Last First" (Bermudez, Caldwell, Lopez, Rubalcaba)
+  - Deleted test data: chris_smith_3039086810 (Firestore), Nathan Snively, Test Test, Chris Smith (Square)
+  - Backfilled squareCustomerId on 41 Firestore parents (up from 10 linked → 52)
+- Final state: 58 parents, 52 with squareCustomerId, 0 dup phones, 0 invoice mismatches
+- 6 remaining parents without squareCustomerId will auto-create on next Text click (flow already handles this)
+- Deployed `deploy.sh` + `.env.deploy` + `.netlify/state.json` — site was linked to wrong GitHub repo so auto-deploy wasn't working; now uses `npm run deploy` with safe deploy script
+
+**Invoice view tracking (earlier in session)**
 - Added invoice view tracking (Square has no native "viewed" API for SHARE_MANUALLY invoices)
 - New `InvoiceActivity` type on Parent: `{squareInvoiceId, publicUrl, amount, sentAt, viewedAt, viewCount, lastReminderAt}` keyed by month
 - New redirect route `src/app/r/[parentId]/[month]/route.ts` — logs `viewedAt` + `viewCount` to Firestore, then 302s to Square publicUrl
