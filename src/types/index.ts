@@ -10,7 +10,7 @@ export interface Player {
 
 export type ParentStatus = 'active' | 'on_break' | 'exempt' | 'inactive';
 export type RateType = 'regular' | 'siblings' | 'special' | 'custom';
-export type PaymentMethod = 'square' | 'zelle' | 'cash' | 'check';
+export type PaymentMethod = 'square' | 'stripe' | 'zelle' | 'cash' | 'check';
 export type Team = '9u/10u/11u' | '12u/13u' | '14u';
 export const TEAMS: Team[] = ['9u/10u/11u', '12u/13u', '14u'];
 
@@ -23,6 +23,7 @@ export interface Parent {
   players: string[];
   playerNames: string[];
   squareCustomerId: string | null;
+  stripeCustomerId: string | null;
   notes: string;
   doNotInvoice: boolean;
   status: ParentStatus;
@@ -46,14 +47,37 @@ export interface MonthlyPayment {
 }
 
 // Per-month invoice tracking — keyed by month string ("2026-04")
+// Supports both Square (legacy) and Stripe (current) invoices on the same record.
 export interface InvoiceActivity {
-  squareInvoiceId: string;
+  // Provider identifier — "square" (legacy) or "stripe" (current)
+  provider?: 'square' | 'stripe';
+  // Square-specific (legacy)
+  squareInvoiceId?: string;
+  // Stripe-specific (current)
+  stripeInvoiceId?: string;
+  stripeCustomerId?: string;
+  stripeStatus?: 'draft' | 'open' | 'paid' | 'void' | 'uncollectible';
+  // Common
   publicUrl: string;
   amount: number;
-  sentAt: string | null;        // when we texted the parent the link
-  viewedAt: string | null;      // most recent click on our redirect URL
-  viewCount: number;            // total clicks
+  sentAt: string | null;
+  viewedAt: string | null;
+  viewCount: number;
   lastReminderAt: string | null;
+  // SMS delivery tracking (Twilio-backed, replaces manual Phone Link)
+  sms?: SmsDelivery;
+  paidAt?: string | null;
+  paidVia?: 'card' | 'ach' | 'cash' | 'check' | 'zelle' | null;
+}
+
+export interface SmsDelivery {
+  twilioSid: string;
+  to: string;
+  status: 'queued' | 'sending' | 'sent' | 'delivered' | 'failed' | 'undelivered';
+  errorCode: string | null;
+  errorMessage: string | null;
+  sentAt: string;
+  deliveredAt: string | null;
 }
 
 export interface LineItem {

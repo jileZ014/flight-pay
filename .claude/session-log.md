@@ -1,4 +1,67 @@
-## 2026-04-10 (current)
+## 2026-05-03 — Stripe + Twilio Unified Invoicing (replaces Square + Phone Link slog)
+**Session type:** VS Code (driven from CoS workspace)
+**ROI tag:** REVENUE + INFRASTRUCTURE
+
+**Why:** April 2026 frustration — 56 manual Phone Link clicks per send cycle, Lashay→Omar mis-routed invoice, Square SHARE_MANUALLY no native view tracking. User wanted unified system NOW with dashboard preserved + automated, accurate sending. Technical board (T13 Collison, T14 DHH, T15 Levels added 2026-05-03) recommended Stripe Invoicing + server-side Twilio batch SMS, dashboard kept, Square dormant as Taleb hedge.
+
+**Tasks completed:**
+
+**New libraries:**
+- `src/lib/stripe.ts` — Stripe v22 server client with helpers: `ensureStripeCustomer` (idempotent search-then-create), `createMonthlyInvoice` (draft → item → finalize, with idempotency keys + auto-void on partial-failure), `voidOpenInvoicesForParentMonth` (canonical "what's open in Stripe right now?" check), `paymentMethodFromPaidInvoice` (reads charge/PI to derive ACH vs card vs wallet), `computeMonthAmountUsd` (custom-rate aware)
+- `src/lib/twilio.ts` — Twilio client + `sendSms` + `sendSmsBatch` (concurrency=5, per-item `onItemComplete` callback so persistence happens as we go, not at end of batch)
+
+**New API routes:**
+- `POST /api/stripe/customer-sync` — bulk-create or refresh Stripe Customers from Firestore parents. Idempotent. Body: `{ all: true }` or `{ parentId: "X" }`. Force flag for refreshing existing.
+- `POST /api/stripe/invoice/create` — single invoice for one parent+month
+- `POST /api/stripe/invoice/batch-create` — bulk for an entire month. Returns 207 partial / 502 all-failed / 200 all-succeeded.
+- `POST /api/stripe/webhook` — receives `invoice.finalized/sent/paid/payment_succeeded/payment_failed/voided/marked_uncollectible` + `customer.updated`. Mirrors to Firestore. Replaces "Sync Square" polling.
+- `POST /api/sms/send` — three modes: bulk per-month / single custom / single resend. Server-side Twilio. Replaces 56 Phone Link clicks.
+
+**Type changes (`src/types/index.ts`):**
+- `Parent.stripeCustomerId: string | null` (parallel to squareCustomerId)
+- `PaymentMethod` adds 'stripe'
+- `InvoiceActivity` extended: optional `provider`, `stripeInvoiceId`, `stripeCustomerId`, `stripeStatus`, `paidAt`, `paidVia`, `sms` (`SmsDelivery`)
+- `SmsDelivery` new type — Twilio sid/status/error tracking
+
+**Dashboard changes (`src/app/page.tsx`):**
+- 3 new buttons in header: "1. Sync Stripe Customers" / "2. Create Stripe Invoices" / "3. Send All SMS via Twilio" (indigo + green)
+- 3 new state vars + handlers: `syncStripeCustomers`, `createStripeInvoicesForCurrentMonth`, `sendStripeInvoicesViaSms`
+- Existing Square buttons preserved as smaller "Square (legacy fallback)" row
+- No removal of existing functionality
+
+**QA results:**
+- Production build passes (5 new routes registered)
+- Dev server smoke test: all 4 new routes return correct error shapes (400 with helpful messages on empty body, 200 on root)
+- Webhook signature verification: PASSED via synthetic payload
+- Twilio API: account active, list works
+- Stripe live API tests: BLOCKED — flight-welcome's sk_test_51Rja2e... is expired. User must rotate at https://dashboard.stripe.com/test/apikeys (30 sec)
+- Board QA review (Cantrill / Charity Majors / Patrick Collison) found 3 BLOCKERs + 2 SHOULD-FIXes — all fixed before commit
+
+**Board QA fixes applied:**
+- BLOCKER 1 (Cantrill): if `invoiceItems.create` fails between draft + finalize, draft would have been finalized as $0 invoice. Fix: try/catch around item-create and finalize, void orphaned draft on either failure. Idempotency keys added.
+- BLOCKER 2 (Cantrill): `invoiceActivity.stripeStatus === 'open'` check trusted Firestore cache; stale cache → duplicate open Stripe invoices. Fix: new `voidOpenInvoicesForParentMonth` queries Stripe directly (`stripe.invoices.list({ customer, status: 'open' })`) and voids matching metadata.
+- BLOCKER 3 (Collison): `paidVia: 'card'` was hardcoded for ALL paid invoices. ACH/CashApp/wallet would have been mis-recorded. Fix: `paymentMethodFromPaidInvoice` reads `charge.payment_method_details.type` or `paymentIntent.payment_method_types[0]`.
+- SHOULD-FIX (Majors): SMS batch persisted Firestore writes only AFTER all sends; mid-batch timeout would lose delivery status. Fix: `sendSmsBatch` now takes `onItemComplete` callback, route persists per-item.
+- SHOULD-FIX (Majors): batch endpoints returned HTTP 200 even when every send failed. Fix: 207 Multi-Status when partial, 502 when all-failed, 200 when all-succeeded.
+- NIT (Cantrill): `computeMonthAmountUsd` returned 0 for `rateType='custom'` parents with `monthlyRate=0` and `customRate>0`. Fix: explicit rateType branch.
+
+**Current state:**
+- All Stripe/Twilio code merged on `main` and built clean
+- TEST mode env vars in `.env.local` (not committed): expired sk_test from flight-welcome + valid Twilio creds from GameTriq-StatTracker
+- LIVE mode key on Forge612 account (acct_1TDHzHGkPljrK6It) ready to drop into Netlify env when going to production
+- Existing Square invoice flow untouched — fallback works
+
+**Remaining (single 30-sec user action when Jonas returns):**
+1. Rotate Stripe TEST keys: https://dashboard.stripe.com/test/apikeys
+2. Update `STRIPE_SECRET_KEY` in `.env.local`
+3. Run `npx tsx scripts/qa-unified-invoicing.ts` — completes the customer-create + invoice-create + 4242-pay end-to-end test
+4. If green: deploy via `bash deploy.sh` and configure webhook in Stripe Dashboard at https://flight-pay.netlify.app/api/stripe/webhook
+
+**To continue:** Awaiting fresh Stripe TEST key from user. Pipeline is otherwise deploy-ready. Tonight's invoices: user can use either the new Stripe pipeline (after key rotation) or fall back to legacy Square buttons — the new code is purely additive.
+
+---
+
+## 2026-04-10 (previous session)
 **Session type:** VS Code
 **ROI tag:** REVENUE + INFRASTRUCTURE
 **Tasks completed:**

@@ -93,6 +93,12 @@ export default function Dashboard() {
   // Existing unpaid invoices from Square (keyed by normalized phone)
   const [existingInvoices, setExistingInvoices] = useState<Map<string, { invoiceId: string; publicUrl: string; amount: number; name: string }>>(new Map());
   const [textingParent, setTextingParent] = useState<string | null>(null);
+  const [sendTextModal, setSendTextModal] = useState<{
+    parent: Parent;
+    phone: string;
+    message: string;
+    amount: number;
+  } | null>(null);
 
   const monthColumns = getMonthColumns();
   const currentMonth = monthColumns[2].key;
@@ -263,12 +269,25 @@ export default function Dashboard() {
     showNotification(`Created ${created} drafts${failed > 0 ? `, ${failed} failed` : ''}`, failed > 0 ? 'error' : 'success');
   };
 
-  // Filter parents
+  // Filter parents — "owes" and "paid" judged by the CURRENT MONTH only,
+  // so the filter matches the top stats ("Paid This Month") instead of a
+  // rolling 3-month balance (which double-counts families that joined partway
+  // through the season).
   const filteredParents = parents.filter(p => {
     if (statusFilter !== 'all' && (p.status || 'active') !== statusFilter) return false;
     if (statusFilter === 'all' && (p.status === 'inactive')) return false;
-    if (filter === 'owes') return getBalance(p) > 0;
-    if (filter === 'paid') return getBalance(p) === 0;
+
+    const status = p.status || 'active';
+    const paidCurrentMonth = p.payments?.[currentMonth]?.status === 'paid';
+
+    if (filter === 'owes') {
+      if (status !== 'active') return false;
+      return !paidCurrentMonth;
+    }
+    if (filter === 'paid') {
+      return paidCurrentMonth;
+    }
+
     if (search) {
       const q = search.toLowerCase();
       const name = `${p.firstName} ${p.lastName}`.toLowerCase();
@@ -309,6 +328,89 @@ export default function Dashboard() {
     if (b) buckets[b].push(p);
   }
   const [openBucket, setOpenBucket] = useState<Bucket | null>(null);
+
+  // ─────────────────────────────────────────────────────────────────────
+  // STRIPE / TWILIO UNIFIED INVOICING (May 2026 — replaces Square + Phone Link)
+  // ─────────────────────────────────────────────────────────────────────
+  const [stripeSyncing, setStripeSyncing] = useState(false);
+  const [stripeBatchCreating, setStripeBatchCreating] = useState(false);
+  const [smsSending, setSmsSending] = useState(false);
+
+  // 1) Sync Stripe Customers — ensures every parent has a stripeCustomerId
+  const syncStripeCustomers = async () => {
+    if (!confirm('Sync ALL parents into Stripe as Customers? This is idempotent — re-runs are safe.')) return;
+    setStripeSyncing(true);
+    try {
+      const res = await fetch('/api/stripe/customer-sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ all: true }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showNotification(`Stripe Customers: ${data.ok} ok, ${data.failed} failed (${data.total} total)`, data.failed === 0 ? 'success' : 'error');
+        loadData();
+      } else {
+        showNotification(`Stripe sync failed: ${data.error ?? 'unknown'}`, 'error');
+      }
+    } catch (err) {
+      showNotification(`Stripe sync error: ${err instanceof Error ? err.message : err}`, 'error');
+    } finally {
+      setStripeSyncing(false);
+    }
+  };
+
+  // 2) Create Stripe Invoices for the current month — parallel to Square's "Create All Drafts"
+  const createStripeInvoicesForCurrentMonth = async () => {
+    const now = new Date();
+    const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    if (!confirm(`Create Stripe invoices for ${month}? This finalizes invoices (parents see hosted URL once we send the SMS).`)) return;
+    setStripeBatchCreating(true);
+    try {
+      const res = await fetch('/api/stripe/invoice/batch-create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ month, daysUntilDue: 7, autoSendEmail: false }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showNotification(`Stripe invoices: ${data.ok} created, ${data.failed} failed (${data.total} attempted)`, data.failed === 0 ? 'success' : 'error');
+        loadData();
+      } else {
+        showNotification(`Stripe invoice batch failed: ${data.error ?? 'unknown'}`, 'error');
+      }
+    } catch (err) {
+      showNotification(`Stripe invoice batch error: ${err instanceof Error ? err.message : err}`, 'error');
+    } finally {
+      setStripeBatchCreating(false);
+    }
+  };
+
+  // 3) Send SMS via Twilio for the current month — replaces 56 Phone Link clicks
+  const sendStripeInvoicesViaSms = async () => {
+    const now = new Date();
+    const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    if (!confirm(`Send SMS via Twilio to all families with a Stripe invoice for ${month}? Goes out automatically — no Phone Link.`)) return;
+    setSmsSending(true);
+    try {
+      const res = await fetch('/api/sms/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ month }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showNotification(`SMS: ${data.ok} sent, ${data.failed} failed (${data.total} attempted)`, data.failed === 0 ? 'success' : 'error');
+        loadData();
+      } else {
+        showNotification(`SMS batch failed: ${data.error ?? 'unknown'}`, 'error');
+      }
+    } catch (err) {
+      showNotification(`SMS batch error: ${err instanceof Error ? err.message : err}`, 'error');
+    } finally {
+      setSmsSending(false);
+    }
+  };
 
   // Re-text every parent in a bucket sequentially (each click opens the parent's SMS app)
   const [bucketTexting, setBucketTexting] = useState(false);
@@ -455,14 +557,24 @@ export default function Dashboard() {
         return;
       }
 
-      // Match to families by phone number
+      // Match to families by phone number.
+      // IMPORTANT: skip any family already marked paid for the current month in
+      // Firestore — Square has stale UNPAID invoices for families who paid in
+      // cash/Zelle (those payment methods don't auto-close Square invoices).
       const matched: typeof pendingInvoices = [];
+      let skippedPaid = 0;
       for (const inv of publishedInvoices) {
         const normalizedInvPhone = inv.phone.replace(/\D/g, '');
         const parent = parents.find(p => {
           const normalizedParentPhone = (p.phone || '').replace(/\D/g, '');
           return normalizedParentPhone === normalizedInvPhone && normalizedInvPhone.length >= 10;
         });
+
+        // Skip if this parent already paid this month via any method (cash/Zelle/Square)
+        if (parent?.payments?.[currentMonth]?.status === 'paid') {
+          skippedPaid++;
+          continue;
+        }
 
         if (parent) {
           matched.push({
@@ -489,6 +601,9 @@ export default function Dashboard() {
             publicUrl: inv.publicUrl,
           });
         }
+      }
+      if (skippedPaid > 0) {
+        showNotification(`Skipped ${skippedPaid} already-paid (cash/Zelle) families from the re-send queue`, 'success');
       }
 
       setPendingInvoices(matched);
@@ -565,7 +680,7 @@ export default function Dashboard() {
             customerId: parent.squareCustomerId,
             lineItems,
             message: getDefaultMessage(overdueMonths),
-            dueDate: '2026-03-12',
+            dueDate: getDefaultDueDate(),
             playerName: (parent.playerNames || []).join(', ') || parent.firstName,
             parentFirstName: parent.firstName,
             parentLastName: parent.lastName,
@@ -617,7 +732,7 @@ export default function Dashboard() {
             customerId: parent.squareCustomerId,
             lineItems,
             message: getDefaultMessage(overdueMonths),
-            dueDate: '2026-03-12',
+            dueDate: getDefaultDueDate(),
             playerName: (parent.playerNames || []).join(', ') || parent.firstName,
             parentFirstName: parent.firstName,
             parentLastName: parent.lastName,
@@ -663,45 +778,8 @@ export default function Dashboard() {
     const trackUrl = `${window.location.origin}/r/${parent.id}/${currentMonth}`;
     const smsBody = `Hi ${parent.firstName}, your AZ Flight Basketball payment of $${amount} is ready. Pay here: ${trackUrl} - Coach Jonas`;
 
-    try {
-      await navigator.clipboard.writeText(smsBody);
-    } catch { /* clipboard may fail in some contexts */ }
-
-    // Open SMS to this parent's number
-    const smsLink = document.createElement('a');
-    smsLink.href = `sms:${normalizedPhone}`;
-    smsLink.click();
-
-    // Save lastTexted + invoiceActivity for this month so it persists across refreshes
-    try {
-      const parentRef = doc(db, 'parents', parent.id);
-      const now = new Date().toISOString();
-      const previousActivity = parent.invoiceActivity?.[currentMonth];
-      // If invoiceId changed (we cancelled + recreated), reset view tracking
-      const sameInvoice = previousActivity?.squareInvoiceId === invoiceId;
-      const newActivity = {
-        squareInvoiceId: invoiceId,
-        publicUrl,
-        amount,
-        sentAt: now,
-        viewedAt: sameInvoice ? previousActivity?.viewedAt ?? null : null,
-        viewCount: sameInvoice ? previousActivity?.viewCount ?? 0 : 0,
-        lastReminderAt: sameInvoice && previousActivity?.sentAt ? now : null,
-      };
-      await updateDoc(parentRef, {
-        lastTexted: now,
-        [`invoiceActivity.${currentMonth}`]: newActivity,
-      });
-      setParents(prev => prev.map(p => p.id === parent.id ? {
-        ...p,
-        lastTexted: now,
-        invoiceActivity: { ...(p.invoiceActivity || {}), [currentMonth]: newActivity },
-      } : p));
-    } catch (err) {
-      console.error('Failed to save lastTexted:', err);
-    }
-
-    showNotification(`Message copied ($${amount})! Paste in Phone Link and send to ${parent.firstName}`, 'success');
+    // Stash invoice details on the modal so the user can confirm-sent later
+    setSendTextModal({ parent, phone: normalizedPhone, message: smsBody, amount });
     setTextingParent(null);
   };
 
@@ -724,37 +802,59 @@ export default function Dashboard() {
 
       {/* Header */}
       <header className="bg-gray-800 border-b border-gray-700 px-6 py-4">
-        <div className="max-w-[1600px] mx-auto flex justify-between items-center">
-          <div>
-            <h1 className="text-2xl font-bold text-orange-500">Flight Pay</h1>
-            <p className="text-gray-400 text-sm">AZ Flight Basketball Payment Tracker</p>
-          </div>
-          <div className="flex gap-3">
-            <button onClick={createAllDrafts} disabled={batchCreating}
-              className="px-4 py-2 bg-purple-600 hover:bg-purple-700 rounded-lg font-medium transition disabled:opacity-50">
-              {batchCreating ? 'Creating Drafts...' : 'Create All Drafts'}
-            </button>
-            <button onClick={resendTexts} disabled={resendLoading}
-              className="px-4 py-2 bg-orange-600 hover:bg-orange-700 rounded-lg font-medium transition disabled:opacity-50">
-              {resendLoading ? 'Loading...' : 'Re-send Texts'}
-            </button>
-            {pendingInvoices.length > 0 && (
-              <button onClick={() => setShowBatchSend(true)}
-                className="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-lg font-bold transition animate-pulse">
-                Send All Texts ({pendingInvoices.length})
-              </button>
-            )}
-            <button onClick={assignTeams} disabled={migrating}
-              className="px-3 py-2 bg-yellow-600 hover:bg-yellow-700 rounded-lg text-sm font-medium transition disabled:opacity-50">
-              {migrating ? 'Assigning...' : 'Set Teams'}
-            </button>
-            <button onClick={syncWithSquare} disabled={syncing}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg font-medium transition disabled:opacity-50">
-              {syncing ? 'Syncing...' : 'Sync Square'}
-            </button>
+        <div className="max-w-[1600px] mx-auto">
+          <div className="flex justify-between items-center mb-3">
+            <div>
+              <h1 className="text-2xl font-bold text-orange-500">Flight Pay</h1>
+              <p className="text-gray-400 text-sm">AZ Flight Basketball — Unified Invoicing (Stripe + Twilio)</p>
+            </div>
             <button onClick={() => setAddModal(true)}
               className="px-4 py-2 bg-orange-500 hover:bg-orange-600 rounded-lg font-medium transition">
               + Add Family
+            </button>
+          </div>
+
+          {/* Unified Stripe/Twilio invoicing pipeline (current) */}
+          <div className="mb-3 flex items-center gap-2 flex-wrap">
+            <span className="text-xs uppercase tracking-wide text-indigo-400 font-semibold mr-2">Invoicing Pipeline</span>
+            <button onClick={syncStripeCustomers} disabled={stripeSyncing}
+              className="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 rounded-lg text-sm font-medium transition disabled:opacity-50">
+              {stripeSyncing ? 'Syncing…' : '1. Sync Stripe Customers'}
+            </button>
+            <button onClick={createStripeInvoicesForCurrentMonth} disabled={stripeBatchCreating}
+              className="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 rounded-lg text-sm font-medium transition disabled:opacity-50">
+              {stripeBatchCreating ? 'Creating…' : '2. Create Stripe Invoices'}
+            </button>
+            <button onClick={sendStripeInvoicesViaSms} disabled={smsSending}
+              className="px-3 py-2 bg-green-600 hover:bg-green-700 rounded-lg text-sm font-bold transition disabled:opacity-50">
+              {smsSending ? 'Sending…' : '3. Send All SMS via Twilio'}
+            </button>
+            <button onClick={assignTeams} disabled={migrating}
+              className="px-3 py-2 bg-yellow-600 hover:bg-yellow-700 rounded-lg text-sm font-medium transition disabled:opacity-50">
+              {migrating ? 'Assigning…' : 'Set Teams'}
+            </button>
+          </div>
+
+          {/* Square fallback (legacy — kept dormant per Taleb hedge) */}
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-xs uppercase tracking-wide text-gray-500 font-semibold mr-2">Square (legacy fallback)</span>
+            <button onClick={createAllDrafts} disabled={batchCreating}
+              className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs font-medium transition disabled:opacity-50">
+              {batchCreating ? 'Creating…' : 'Create Square Drafts'}
+            </button>
+            <button onClick={resendTexts} disabled={resendLoading}
+              className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs font-medium transition disabled:opacity-50">
+              {resendLoading ? 'Loading…' : 'Re-send via Phone Link'}
+            </button>
+            {pendingInvoices.length > 0 && (
+              <button onClick={() => setShowBatchSend(true)}
+                className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs font-bold transition">
+                Send All Texts ({pendingInvoices.length})
+              </button>
+            )}
+            <button onClick={syncWithSquare} disabled={syncing}
+              className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs font-medium transition disabled:opacity-50">
+              {syncing ? 'Syncing…' : 'Sync Square'}
             </button>
           </div>
         </div>
@@ -838,15 +938,49 @@ export default function Dashboard() {
                               {viewedAgo !== null && <span className="ml-2 text-yellow-400">· viewed {fmt(viewedAgo)} ({activity?.viewCount ?? 0}x)</span>}
                             </p>
                           </div>
-                          {openBucket !== 'paid' && p.phone && (
-                            <button
-                              onClick={() => sendTextToParent(p)}
-                              disabled={textingParent === p.id}
-                              className="px-3 py-1.5 bg-green-600 hover:bg-green-700 rounded-md text-sm font-medium disabled:opacity-50"
-                            >
-                              {textingParent === p.id ? '...' : (activity?.sentAt ? 'Re-text' : 'Text')}
-                            </button>
-                          )}
+                          <div className="flex gap-2">
+                            {openBucket !== 'paid' && activity?.sentAt && (
+                              <button
+                                onClick={async () => {
+                                  if (!confirm(`Mark ${p.firstName} as NOT texted? (This clears the sent/viewed history for ${currentMonthLabel} only.)`)) return;
+                                  try {
+                                    const res = await fetch('/api/audit/clear-sent', {
+                                      method: 'POST',
+                                      headers: { 'Content-Type': 'application/json' },
+                                      body: JSON.stringify({ parentIds: [p.id], month: currentMonth }),
+                                    });
+                                    const data = await res.json();
+                                    if (data.success) {
+                                      setParents(prev => prev.map(x => {
+                                        if (x.id !== p.id) return x;
+                                        const nextActivity = { ...(x.invoiceActivity || {}) };
+                                        delete nextActivity[currentMonth];
+                                        return { ...x, invoiceActivity: nextActivity };
+                                      }));
+                                      showNotification(`Cleared sent history for ${p.firstName}`, 'success');
+                                    } else {
+                                      showNotification('Failed to clear sent history', 'error');
+                                    }
+                                  } catch {
+                                    showNotification('Failed to clear sent history', 'error');
+                                  }
+                                }}
+                                className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded-md text-sm font-medium"
+                                title="Clear the sent/viewed history for this month only — use when the family was marked sent but wasn't actually texted"
+                              >
+                                Undo sent
+                              </button>
+                            )}
+                            {openBucket !== 'paid' && p.phone && (
+                              <button
+                                onClick={() => sendTextToParent(p)}
+                                disabled={textingParent === p.id}
+                                className="px-3 py-1.5 bg-green-600 hover:bg-green-700 rounded-md text-sm font-medium disabled:opacity-50"
+                              >
+                                {textingParent === p.id ? '...' : (activity?.sentAt ? 'Re-text' : 'Text')}
+                              </button>
+                            )}
+                          </div>
                         </div>
                       );
                     })}
@@ -944,7 +1078,11 @@ export default function Dashboard() {
                   const status = parent.status || 'active';
                   const unpaidExtras = (parent.lineItems || []).filter(li => li.status !== 'paid');
                   const extrasTotal = unpaidExtras.reduce((s, li) => s + li.amount, 0);
-                  const canInvoice = balance > 0 && parent.phone && status === 'active';
+                  // Only treat this family as needing an invoice if they haven't paid the CURRENT MONTH.
+                  // (getBalance sums unpaid cells across all 3 visible months, which inflates the count
+                  // for families that joined partway through the season and never had earlier months billed.)
+                  const paidCurrentMonth = parent.payments?.[currentMonth]?.status === 'paid';
+                  const canInvoice = !paidCurrentMonth && parent.phone && status === 'active';
 
                   return (
                     <tr key={parent.id} className="border-b border-gray-700 hover:bg-gray-700/50">
@@ -1057,38 +1195,67 @@ export default function Dashboard() {
                       {/* Actions */}
                       <td className="px-4 py-3 text-right">
                         <div className="flex justify-end gap-1">
-                          {canInvoice && (() => {
-                            const normalizedPhone = (parent.phone || '').replace(/\D/g, '').replace(/^1/, '');
-                            const hasExistingInvoice = existingInvoices.has(normalizedPhone);
+                          {(() => {
+                            // Show a concrete status line per family for the current month —
+                            // Paid · Viewed · Sent · Not Sent — similar to Square's invoice list.
+                            const activity = parent.invoiceActivity?.[currentMonth];
+                            const paid = parent.payments?.[currentMonth];
+                            const fmtDate = (iso: string) => new Date(iso).toLocaleDateString('en-US', { month: 'numeric', day: 'numeric', year: '2-digit' });
 
-                            if (parent.lastTexted) {
-                              const textedDate = new Date(parent.lastTexted);
-                              const timeAgo = Math.round((Date.now() - textedDate.getTime()) / 60000);
-                              const label = timeAgo < 60 ? `${timeAgo}m ago` : timeAgo < 1440 ? `${Math.round(timeAgo / 60)}h ago` : `${Math.round(timeAgo / 1440)}d ago`;
-                              const activity = parent.invoiceActivity?.[currentMonth];
-                              const viewed = !!activity?.viewedAt;
+                            // PAID — highest priority
+                            if (paid?.status === 'paid') {
                               return (
-                                <div className="flex flex-col items-end gap-1">
-                                  <span className={`px-4 py-2 border rounded-md text-base font-medium ${viewed ? 'bg-yellow-600/30 border-yellow-600 text-yellow-200' : 'bg-green-600/30 border-green-600 text-green-300'}`}>
-                                    {viewed ? `Viewed ✓ (${activity?.viewCount ?? 0})` : 'Texted ✓'}
+                                <div className="flex flex-col items-end gap-0.5">
+                                  <span className="px-3 py-1.5 bg-green-600/30 border border-green-600 text-green-300 rounded text-sm font-semibold">
+                                    Paid {paid.method ? `(${paid.method})` : ''}
                                   </span>
-                                  <span className="text-xs text-gray-500">{label}</span>
-                                  <button onClick={() => sendTextToParent(parent)}
-                                    disabled={textingParent === parent.id}
-                                    className="text-xs text-blue-400 hover:text-blue-300 disabled:opacity-50">
+                                  {paid.paidAt && <span className="text-xs text-gray-500">{fmtDate(paid.paidAt)}</span>}
+                                </div>
+                              );
+                            }
+
+                            // Only show text/re-text controls for active families with a phone
+                            if (!canInvoice) return null;
+
+                            // VIEWED · UNPAID
+                            if (activity?.viewedAt) {
+                              return (
+                                <div className="flex flex-col items-end gap-0.5">
+                                  <span className="px-3 py-1.5 bg-yellow-600/30 border border-yellow-600 text-yellow-200 rounded text-sm font-semibold">
+                                    Viewed ({activity.viewCount ?? 0}×)
+                                  </span>
+                                  <span className="text-xs text-gray-500">viewed {fmtDate(activity.viewedAt)}</span>
+                                  <button onClick={() => sendTextToParent(parent)} disabled={textingParent === parent.id}
+                                    className="text-xs text-blue-400 hover:text-blue-300 disabled:opacity-50 mt-0.5">
                                     {textingParent === parent.id ? 'Updating...' : 'Re-text'}
                                   </button>
                                 </div>
                               );
-                            } else {
+                            }
+
+                            // SENT · NOT VIEWED
+                            if (activity?.sentAt) {
                               return (
-                                <button onClick={() => sendTextToParent(parent)}
-                                  disabled={textingParent === parent.id}
-                                  className="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-md text-base font-medium transition disabled:opacity-50">
-                                  {textingParent === parent.id ? 'Creating...' : 'Text'}
-                                </button>
+                                <div className="flex flex-col items-end gap-0.5">
+                                  <span className="px-3 py-1.5 bg-orange-600/30 border border-orange-600 text-orange-200 rounded text-sm font-semibold">
+                                    Sent · not viewed
+                                  </span>
+                                  <span className="text-xs text-gray-500">sent {fmtDate(activity.sentAt)}</span>
+                                  <button onClick={() => sendTextToParent(parent)} disabled={textingParent === parent.id}
+                                    className="text-xs text-blue-400 hover:text-blue-300 disabled:opacity-50 mt-0.5">
+                                    {textingParent === parent.id ? 'Updating...' : 'Re-text'}
+                                  </button>
+                                </div>
                               );
                             }
+
+                            // NOT SENT — the green call-to-action
+                            return (
+                              <button onClick={() => sendTextToParent(parent)} disabled={textingParent === parent.id}
+                                className="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-md text-base font-medium transition disabled:opacity-50">
+                                {textingParent === parent.id ? 'Creating...' : 'Text'}
+                              </button>
+                            );
                           })()}
                           <button onClick={() => setEditModal(parent)}
                             className="px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded-md text-base font-medium transition">
@@ -1107,6 +1274,100 @@ export default function Dashboard() {
           </div>
         )}
       </main>
+
+      {/* Send Text Modal — shown when user clicks Text/Re-text.
+          Big tap targets for the phone + message, then a Mark Sent button
+          that stamps invoiceActivity.sentAt. */}
+      {sendTextModal && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-2xl max-w-lg w-full p-6 border border-gray-700">
+            <div className="flex justify-between items-start mb-4">
+              <div>
+                <h2 className="text-2xl font-bold text-white">Text {sendTextModal.parent.firstName}</h2>
+                <p className="text-gray-400 text-sm">${sendTextModal.amount} · {currentMonthLabel}</p>
+              </div>
+              <button onClick={() => setSendTextModal(null)} className="text-gray-400 hover:text-white text-2xl leading-none">×</button>
+            </div>
+
+            {/* Phone — tap to copy */}
+            <div className="mb-4">
+              <p className="text-xs text-gray-400 uppercase tracking-wide mb-1">Phone (tap to copy)</p>
+              <button
+                onClick={async () => {
+                  try { await navigator.clipboard.writeText(sendTextModal.phone); showNotification('Phone copied', 'success'); } catch {}
+                }}
+                className="w-full bg-gray-900 hover:bg-gray-700 rounded-lg px-4 py-4 text-left text-xl font-mono text-white border border-gray-700"
+              >
+                {sendTextModal.phone}
+              </button>
+            </div>
+
+            {/* Message — tap to copy */}
+            <div className="mb-4">
+              <p className="text-xs text-gray-400 uppercase tracking-wide mb-1">Message (tap to copy)</p>
+              <button
+                onClick={async () => {
+                  try { await navigator.clipboard.writeText(sendTextModal.message); showNotification('Message copied', 'success'); } catch {}
+                }}
+                className="w-full bg-gray-900 hover:bg-gray-700 rounded-lg px-4 py-3 text-left text-sm text-white whitespace-pre-wrap border border-gray-700"
+              >
+                {sendTextModal.message}
+              </button>
+            </div>
+
+            {/* Actions */}
+            <div className="flex gap-3 mt-6">
+              <button
+                onClick={() => setSendTextModal(null)}
+                className="flex-1 px-4 py-3 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  const { parent, amount } = sendTextModal;
+                  try {
+                    const parentRef = doc(db, 'parents', parent.id);
+                    const now = new Date().toISOString();
+                    const previous = parent.invoiceActivity?.[currentMonth];
+                    const existingInv = existingInvoices.get((parent.phone || '').replace(/\D/g, '').replace(/^1/, ''));
+                    const newActivity = {
+                      squareInvoiceId: existingInv?.invoiceId || previous?.squareInvoiceId || '',
+                      publicUrl: existingInv?.publicUrl || previous?.publicUrl || '',
+                      amount,
+                      sentAt: now,
+                      viewedAt: previous?.viewedAt ?? null,
+                      viewCount: previous?.viewCount ?? 0,
+                      lastReminderAt: previous?.sentAt ? now : null,
+                    };
+                    await updateDoc(parentRef, {
+                      lastTexted: now,
+                      [`invoiceActivity.${currentMonth}`]: newActivity,
+                    });
+                    setParents(prev => prev.map(p => p.id === parent.id ? {
+                      ...p,
+                      lastTexted: now,
+                      invoiceActivity: { ...(p.invoiceActivity || {}), [currentMonth]: newActivity },
+                    } : p));
+                    showNotification(`Marked ${parent.firstName} as sent`, 'success');
+                  } catch (err) {
+                    console.error(err);
+                    showNotification('Failed to save', 'error');
+                  }
+                  setSendTextModal(null);
+                }}
+                className="flex-1 px-4 py-3 bg-green-600 hover:bg-green-700 rounded-lg font-bold"
+              >
+                ✓ Mark Sent
+              </button>
+            </div>
+
+            <p className="text-xs text-gray-500 mt-3 text-center">
+              Tap each field to copy. Paste into your messaging app, send, then tap Mark Sent.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Edit Family Modal */}
       {editModal && (

@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "deploy": "bash deploy.sh"
   },
   "dependencies": {
     "@netlify/plugin-nextjs": "^5.15.4",
@@ -16,6 +17,8 @@
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "square": "^43.2.1",
+    "stripe": "^22.1.0",
+    "twilio": "^6.0.0",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
@@ -26,6 +29,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.1.1",
     "tailwindcss": "^4",
+    "tsx": "^4.21.0",
     "typescript": "^5"
   }
 }
