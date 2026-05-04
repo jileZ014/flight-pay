@@ -1,3 +1,23 @@
+## 2026-05-03 — Flight_Pay DEPLOYED + WEBHOOK LIVE 🚀
+**Session type:** VS Code (driven from CoS workspace)
+**ROI tag:** REVENUE + INFRASTRUCTURE
+
+**Deployed to production:**
+- Set 7 Netlify env vars (Stripe test keys, Twilio creds, app URL, webhook secret placeholder)
+- Ran `bash deploy.sh --yes` (the `--yes` was missing the first time, prompted for confirmation)
+- Production deploy live at https://flight-pay.netlify.app (deploy id 69f814c604285ff665802e21)
+- All 5 new routes verified live with correct error shapes (400 for empty body, 200 for homepage)
+- Registered Stripe webhook endpoint programmatically via new script: `scripts/register-stripe-webhook.ts`
+  - Endpoint id: `we_1TTDMzGkPljrK6ItrkYNiHia`
+  - Signing secret pulled and pushed to Netlify env STRIPE_WEBHOOK_SECRET automatically
+  - 8 events subscribed: invoice.finalized/sent/paid/payment_succeeded/payment_failed/voided/marked_uncollectible + customer.updated
+- Redeployed (deploy id 69f815669eed9823a9ea5377) so webhook secret takes effect
+- Triggered live `stripe trigger invoice.paid` against the deployed webhook — `pending_webhooks: 0` confirms 2xx delivery
+
+**Status:** Pipeline is FULLY LIVE in TEST mode. Zero remaining setup steps. To go to production: swap `STRIPE_SECRET_KEY` in Netlify from sk_test_* to sk_live_* (Forge612 live key already in az-flight-hoops/.env.local) and redeploy.
+
+---
+
 ## 2026-05-03 — Stripe + Twilio Unified Invoicing — FULL QA GREEN 🎉
 **Session type:** VS Code (driven from CoS workspace)
 **ROI tag:** REVENUE + INFRASTRUCTURE
