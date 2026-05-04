@@ -145,13 +145,22 @@ async function main() {
 
   console.log(`\n  Hosted invoice URL: ${hostedUrl}\n`);
 
-  console.log('3. Test card payment (4242 4242 4242 4242 via pm_card_visa)');
-  await step('Creating PaymentMethod from tok_visa', async () => {
-    // Stripe test mode magic — tok_visa simulates a successful 4242 card
-    // We use stripe.paymentIntents.confirm with a pm_card_visa for invoices
+  console.log('3. Test card payment (4242 4242 4242 4242)');
+  let attachedPmId = '';
+  await step('Attaching real PaymentMethod (4242 card) to customer', async () => {
+    // Create a real PaymentMethod from raw card data (test mode only). This returns a stable
+    // pm_* id that we can attach + reuse. The magic 'pm_card_visa' string returns a NEW PM
+    // each time it's referenced, which causes "pm not attached" errors on second-use.
+    const pm = await stripe.paymentMethods.create({
+      type: 'card',
+      card: { token: 'tok_visa' },
+    });
+    await stripe.paymentMethods.attach(pm.id, { customer: customerId });
+    attachedPmId = pm.id;
+  });
+  await step('Paying invoice with attached test card', async () => {
     const paid = await stripe.invoices.pay(invoiceId, {
-      payment_method: 'pm_card_visa',
-      paid_out_of_band: false,
+      payment_method: attachedPmId,
     });
     if (paid.status !== 'paid') throw new Error(`expected status=paid, got ${paid.status}`);
     if (paid.amount_paid !== 9500) throw new Error(`expected amount_paid=9500, got ${paid.amount_paid}`);

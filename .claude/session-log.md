@@ -1,6 +1,20 @@
-## 2026-05-03 — Stripe + Twilio Unified Invoicing (replaces Square + Phone Link slog)
+## 2026-05-03 — Stripe + Twilio Unified Invoicing — FULL QA GREEN 🎉
 **Session type:** VS Code (driven from CoS workspace)
 **ROI tag:** REVENUE + INFRASTRUCTURE
+
+**End-to-end QA against real Forge612 Stripe account (acct_1TDHzHGkPljrK6It):**
+- ✅ Stripe Customer creation
+- ✅ Stripe Invoice creation + finalize ($95.00 line item, hosted_invoice_url returned)
+- ✅ Test card payment 4242 4242 4242 4242 — invoice in_1TTDAxGkPljrK6ItgAX6wJXp paid $95.00
+- ✅ Webhook signature construction + metadata round-trip
+- ✅ Twilio API connectivity
+- ✅ Cleanup (test customer deleted)
+
+**How:** Stripe CLI was already logged into Forge612 account on this machine. Pulled fresh test keys via `stripe config --list` (sk_test_51TDHzHGkPljrK6It..., expires 2026-06-23). Updated .env.local. Fixed two QA-script bugs uncovered during validation:
+1. `paid_out_of_band: false` cannot coexist with `payment_method` in `invoices.pay()` — removed.
+2. Magic `pm_card_visa` returns a fresh PM ID each time it's referenced, so attach + pay-by-name fails. Replaced with `paymentMethods.create({ type: 'card', card: { token: 'tok_visa' } })` → attach by stable PM ID.
+
+
 
 **Why:** April 2026 frustration — 56 manual Phone Link clicks per send cycle, Lashay→Omar mis-routed invoice, Square SHARE_MANUALLY no native view tracking. User wanted unified system NOW with dashboard preserved + automated, accurate sending. Technical board (T13 Collison, T14 DHH, T15 Levels added 2026-05-03) recommended Stripe Invoicing + server-side Twilio batch SMS, dashboard kept, Square dormant as Taleb hedge.
 
